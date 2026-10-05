@@ -1,0 +1,1 @@
+# TaleSpire GM Logger
