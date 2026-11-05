@@ -1,0 +1,24 @@
+{
+    "version": 1,
+    "kdf": {
+        "name": "pbkdf2_hmac_sha256",
+        "iterations": 600000,
+        "salt_bytes": 16
+    },
+    "users": {
+        "owner1": {
+            "salt": "a5c51163039ac935d0fd2a4f747e9d9b",
+            "verifier": "dbc08facdffa2e76d491b336627ff266d2fc4fc56e1215c5721a61c231f7906d",
+            "roles": [
+                "owner"
+            ],
+            "created": "2026-11-05T16:22:41",
+            "failed_count": 0,
+            "lock_level": 0,
+            "locked_until": 0,
+            "totp": null,
+            "totp_last_counter": null
+        }
+    },
+    "mac": "391b2abd501aab04913d51fdc36767d4e3117591d945c2d2d5bc6ee3d37a7a0f"
+}
