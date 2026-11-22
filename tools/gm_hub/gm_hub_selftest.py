@@ -2,11 +2,13 @@ import base64
 import http.client
 import json
 import os
+import shutil
 import ssl
 import tempfile
 import threading
 from urllib.parse import urlencode
 
+from gm_hub_logging import verify_security_chain
 from gm_hub_server import HubState, generate_ca_and_server_certs, sha256_hex, start_https_server
 
 
@@ -28,17 +30,18 @@ def https_req(port: int, ctx: ssl.SSLContext, method: str, path: str, headers=No
 
 
 def run_selftest() -> None:
-    print("TaleSpire GM Hub 1.0.0 — комплексна самоперевірка клієнт-серверної безпеки")
+    print("TaleSpire GM Hub 1.1.0 — комплексна самоперевірка (ЛР10-11 + ЛР12)")
     with tempfile.TemporaryDirectory() as tmp:
         ca_cert = os.path.join(tmp, "ca_cert.pem")
         srv_cert = os.path.join(tmp, "srv_cert.pem")
         srv_key = os.path.join(tmp, "srv_key.pem")
+        log_dir = os.path.join(tmp, "logs")
         ca_fp = generate_ca_and_server_certs(ca_cert, srv_cert, srv_key)
 
         bad_ca = os.path.join(tmp, "bad_ca.pem")
         generate_ca_and_server_certs(bad_ca, os.path.join(tmp, "b1.pem"), os.path.join(tmp, "b2.pem"))
 
-        state = HubState(token_ttl=600, max_failures=5, lock_seconds=300)
+        state = HubState(log_dir=log_dir, token_ttl=600, max_failures=5, lock_seconds=300)
         gm_sec = state.add_client("oleksii-gm", "gm_admin")
         player_sec = state.add_client("player-demo", "player_tester")
         auditor_sec = state.add_client("auditor-demo", "auditor")
@@ -52,16 +55,16 @@ def run_selftest() -> None:
         ctx_bad = ssl.create_default_context(cafile=bad_ca)
 
         passed = 0
-        total = 16
+        total = 22
 
         def check(num: int, title: str, cond: bool, detail: str) -> None:
             nonlocal passed
             assert cond, f"FAILED {num}: {title} ({detail})"
             passed += 1
-            print(f"{num:2d}. OK  {title:<55} | {detail}")
+            print(f"{num:2d}. OK  {title:<57} | {detail}")
 
         try:
-            st, _, data = https_req(port, ctx_ok, "GET", "/api/v1/health")
+            st, _, _ = https_req(port, ctx_ok, "GET", "/api/v1/health")
             check(1, "TLS: /api/v1/health через HTTPS із перевіркою CA", st == 200, f"HTTP {st}, CA_FP={ca_fp}")
 
             tls_err = ""
@@ -113,8 +116,16 @@ def run_selftest() -> None:
                 form_cc,
             )
             gm_token = d5["access_token"]
+            gm_tok_req_id = h5.get("X-Request-ID", "")
             only_hash = gm_token not in state.tokens and sha256_hex(gm_token) in state.tokens
             check(8, "Token: Bearer 600s, no-store, у БД лише SHA-256", st5 == 200 and only_hash and h5.get("Cache-Control") == "no-store", f"HTTP 200, fp={sha256_hex(gm_token)[:12]}")
+
+            _, _, d_aud = https_req(
+                port, ctx_ok, "POST", "/oauth/token",
+                {"Authorization": basic_hdr("auditor-demo", auditor_sec), "Content-Type": "application/x-www-form-urlencoded"},
+                form_cc,
+            )
+            auditor_token = d_aud["access_token"]
 
             form_bad_scope = urlencode({"grant_type": "client_credentials", "scope": "releases:write"}).encode()
             st6, _, d6 = https_req(
@@ -145,18 +156,18 @@ def run_selftest() -> None:
             )
             check(12, "AuthZ: player-demo публікує реліз -> 403", st10 == 403 and d10["error"] == "insufficient_scope", f"HTTP {st10} {d10.get('error')}")
 
-            st11, _, d11 = https_req(
+            st11, _, _ = https_req(
                 port, ctx_ok, "POST", "/api/v1/releases",
                 {"Authorization": f"Bearer {gm_token}", "Content-Type": "application/json"},
                 rel_body,
             )
             spoof_body = json.dumps({"version": "1.2.2", "published_by": "fake-admin"}).encode()
-            st12, _, d12 = https_req(
+            st12, _, _ = https_req(
                 port, ctx_ok, "POST", "/api/v1/releases",
                 {"Authorization": f"Bearer {gm_token}", "Content-Type": "application/json"},
                 spoof_body,
             )
-            st13, _, d13 = https_req(
+            st13, _, _ = https_req(
                 port, ctx_ok, "POST", "/api/v1/releases",
                 {"Authorization": f"Bearer {gm_token}", "Content-Type": "application/json"},
                 rel_body,
@@ -173,21 +184,106 @@ def run_selftest() -> None:
                     {"Authorization": basic_hdr("auditor-demo", "bad-secret"), "Content-Type": "application/x-www-form-urlencoded"},
                     form_cc,
                 )
-            st16, h16, d16 = https_req(
+            st16, h16, _ = https_req(
                 port, ctx_ok, "POST", "/oauth/token",
                 {"Authorization": basic_hdr("auditor-demo", auditor_sec), "Content-Type": "application/x-www-form-urlencoded"},
                 form_cc,
             )
             check(15, "Brute-force: 5 невдач -> 429 навіть із вірним секретом", st16 == 429 and "Retry-After" in h16, f"HTTP {st16} Retry-After={h16.get('Retry-After')}s")
 
-            joined_logs = "\n".join(state.audit_log)
-            clean_logs = all(s not in joined_logs for s in (gm_sec, player_sec, auditor_sec, gm_token, player_token))
-            check(16, "Audit log: без секретів і сирих токенів (лише fp)", clean_logs, f"записів={len(state.audit_log)}, витоків=0")
+            # --- ЛР12: Логування, кореляція, метрики, алерти, цілісність, редагування ---
+            linked = [e for e in state.logger.memory_general if e.get("request_id") == gm_tok_req_id]
+            linked_events = {e["event"] for e in linked}
+            ts_utc = all(e["ts"].endswith("Z") for e in linked)
+            check(
+                16,
+                "ЛР12 Лог: JSONL UTC + кореляція X-Request-ID",
+                ts_utc and {"auth.token_issued", "http.access"}.issubset(linked_events),
+                f"req_id={gm_tok_req_id}, events={sorted(linked_events)}",
+            )
+
+            _, _, d_pl2 = https_req(
+                port, ctx_ok, "POST", "/oauth/token",
+                {"Authorization": basic_hdr("player-demo", player_sec), "Content-Type": "application/x-www-form-urlencoded"},
+                form_cc,
+            )
+            st_m1, _, _ = https_req(port, ctx_ok, "GET", "/api/v1/metrics", {"Authorization": f"Bearer {d_pl2['access_token']}"})
+            st_m2, _, m_data = https_req(port, ctx_ok, "GET", "/api/v1/metrics", {"Authorization": f"Bearer {auditor_token}"})
+            check(
+                17,
+                "ЛР12 Метрики: /api/v1/metrics (player 403 / auditor 200)",
+                st_m1 == 403 and st_m2 == 200 and m_data.get("total_requests", 0) > 0,
+                f"player={st_m1}, auditor={st_m2}, reqs={m_data.get('total_requests')}, p95={m_data['latency_ms']['p95']}ms",
+            )
+
+            for i in range(3):
+                https_req(
+                    port, ctx_ok, "POST", "/oauth/token",
+                    {"Authorization": basic_hdr("scanner-bot", "bad"), "Content-Type": "application/x-www-form-urlencoded"},
+                    form_cc,
+                )
+            for i in range(10):
+                https_req(port, ctx_ok, "GET", f"/api/v1/probe_{i}")
+            fired_rules = {e["rule"] for e in state.logger.memory_security if e["event"] == "alert.raised"}
+            check(
+                18,
+                "ЛР12 Алерти: lockout, bruteforce_ip, scan_404",
+                {"auth.lockout", "auth.bruteforce_ip", "http.scan_404"}.issubset(fired_rules),
+                f"rules={sorted(fired_rules)}",
+            )
+
+            sec_path = state.logger.security_log_path()
+            ok_intact, sec_count, errs_intact = verify_security_chain(sec_path)
+            check(
+                19,
+                "ЛР12 Цілісність: ланцюг SHA-256 безпекового журналу",
+                ok_intact and sec_count >= 15 and not errs_intact,
+                f"записів={sec_count}, chain=OK",
+            )
+
+            tampered_path = os.path.join(tmp, "tampered_security.jsonl")
+            shutil.copyfile(sec_path, tampered_path)
+            with open(tampered_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            rec_mid = json.loads(lines[5])
+            rec_mid["ip"] = "198.51.100.99"
+            lines[5] = json.dumps(rec_mid, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+            with open(tampered_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            ok_tamp, _, errs_tamp = verify_security_chain(tampered_path)
+            check(
+                20,
+                "ЛР12 Tamper: зміна рядка 6 виявляється миттєво",
+                not ok_tamp and any("рядок 6" in e for e in errs_tamp),
+                errs_tamp[0] if errs_tamp else "",
+            )
+
+            redacted_rec = state.logger.emit(
+                "INFO",
+                "selftest.redaction",
+                client_secret="super_secret_123",
+                detail="Authorization: Bearer gmh_topsecretvalue999",
+            )
+            check(
+                21,
+                "ЛР12 Редагування: секрети й Bearer -> [REDACTED]",
+                redacted_rec["client_secret"] == "[REDACTED]" and "[REDACTED]" in redacted_rec["detail"] and "gmh_topsecret" not in redacted_rec["detail"],
+                f"detail={redacted_rec['detail']}",
+            )
+
+            gen_text = open(state.logger.general_log_path(), "r", encoding="utf-8").read()
+            sec_text = open(sec_path, "r", encoding="utf-8").read()
+            all_text = gen_text + sec_text
+            secrets_to_check = (gm_sec, player_sec, auditor_sec, gm_token, player_token, auditor_token, d_pl2["access_token"])
+            clean_logs = all(s not in all_text for s in secrets_to_check)
+            check(
+                22,
+                "ЛР12 Аудит файлів: 0 витоків секретів і сирих токенів",
+                clean_logs,
+                f"general={len(state.logger.memory_general)}, security={sec_count}, витоків=0",
+            )
 
             print(f"\ngm_hub selftest: {passed}/{total} OK")
-            print("--- Останні записи журналу аудиту ---")
-            for line in state.audit_log[-6:]:
-                print(" ", line)
         finally:
             srv.shutdown()
             srv.server_close()

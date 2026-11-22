@@ -15,6 +15,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from gm_hub_logging import HubLogger, HubMetrics
+
 ROLE_SCOPES: dict[str, set[str]] = {
     "gm_admin": {"releases:write", "sessions:read", "sessions:write", "audit:read"},
     "player_tester": {"sessions:write", "sessions:read:own"},
@@ -114,7 +116,14 @@ def generate_ca_and_server_certs(ca_cert_path: str, srv_cert_path: str, srv_key_
 
 
 class HubState:
-    def __init__(self, token_ttl: int = 600, max_failures: int = 5, lock_seconds: int = 300) -> None:
+    def __init__(
+        self,
+        log_dir: str | None = None,
+        token_ttl: int = 600,
+        max_failures: int = 5,
+        lock_seconds: int = 300,
+    ) -> None:
+        self.version = "1.1.0"
         self.token_ttl = token_ttl
         self.max_failures = max_failures
         self.lock_seconds = lock_seconds
@@ -122,7 +131,9 @@ class HubState:
         self.tokens: dict[str, dict] = {}
         self.releases: dict[str, dict] = {}
         self.failures: dict[str, dict] = {}
-        self.audit_log: list[str] = []
+        self.logger = HubLogger(log_dir=log_dir, version=self.version)
+        self.metrics = HubMetrics()
+        self.logger.emit("INFO", "server.initialized", security=True, tls=True, token_ttl_s=token_ttl)
 
     def add_client(self, client_id: str, role: str) -> str:
         if role not in ROLE_SCOPES:
@@ -134,12 +145,22 @@ class HubState:
             "scopes": set(ROLE_SCOPES[role]),
             "enabled": True,
         }
+        self.logger.emit("INFO", "admin.client_added", security=True, client_id=client_id, role=role)
         return raw_secret
 
-    def log(self, event: str, **fields) -> None:
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        meta = " ".join(f"{k}={v}" for k, v in fields.items())
-        self.audit_log.append(f"{ts} {event} {meta}".strip())
+    def emit_alerts(self, alerts: list[dict], request_id: str | None, ip: str | None) -> None:
+        for alert in alerts:
+            self.logger.emit(
+                "WARNING",
+                "alert.raised",
+                security=True,
+                request_id=request_id,
+                ip=ip,
+                rule=alert["rule"],
+                subject=alert["subject"],
+                count=alert["count"],
+                window_s=alert["window_s"],
+            )
 
 
 class SecureHTTPServer(ThreadingHTTPServer):
@@ -148,20 +169,32 @@ class SecureHTTPServer(ThreadingHTTPServer):
         self.state = state
 
     def handle_error(self, request, client_address) -> None:
-        pass
+        self.state.logger.emit(
+            "WARNING",
+            "tls.handshake_failed",
+            security=True,
+            ip=client_address[0] if client_address else "unknown",
+        )
 
 
 class GMHubHandler(BaseHTTPRequestHandler):
-    server_version = "TaleSpireGMHub/1.0"
+    server_version = "TaleSpireGMHub/1.1"
 
     def log_message(self, format, *args) -> None:
         pass
 
+    def _begin_request(self, path: str) -> None:
+        self._req_id = secrets.token_hex(8)
+        self._start_ts = time.perf_counter()
+        self._route_name = path
+        self._client_id: str | None = None
+        self._token_fp: str | None = None
+        self._client_ip = self.client_address[0] if self.client_address else "unknown"
+
     def _send_json(self, status: int, body: dict, extra_headers: dict | None = None) -> None:
-        req_id = secrets.token_hex(6)
         payload = dict(body)
         if status >= 400:
-            payload.setdefault("request_id", req_id)
+            payload.setdefault("request_id", self._req_id)
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -169,12 +202,31 @@ class GMHubHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Pragma", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Request-ID", req_id)
+        self.send_header("X-Request-ID", self._req_id)
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, v)
         self.end_headers()
         self.wfile.write(raw)
+
+        duration_ms = round((time.perf_counter() - self._start_ts) * 1000.0, 2)
+        state: HubState = self.server.state
+        alerts = state.metrics.record_http(self._route_name, status, self._client_ip, duration_ms)
+        state.logger.emit(
+            "WARNING" if status >= 400 else "INFO",
+            "http.access",
+            security=False,
+            request_id=self._req_id,
+            ip=self._client_ip,
+            client_id=self._client_id,
+            token_fp=self._token_fp,
+            method=self.command,
+            path=self._route_name,
+            status=status,
+            bytes=len(raw),
+            duration_ms=duration_ms,
+        )
+        state.emit_alerts(alerts, self._req_id, self._client_ip)
 
     def _read_body(self, max_bytes: int = 16384) -> bytes | None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -184,30 +236,65 @@ class GMHubHandler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length > 0 else b""
 
     def _require_token(self, required_scope: str | None = None) -> tuple[str, dict] | None:
+        state: HubState = self.server.state
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
+            state.logger.emit(
+                "WARNING",
+                "auth.denied",
+                security=True,
+                request_id=self._req_id,
+                ip=self._client_ip,
+                route=self._route_name,
+                reason="missing_bearer",
+            )
             self._send_json(
                 401,
                 {"error": "unauthorized", "message": "Bearer token required"},
                 {"WWW-Authenticate": 'Bearer realm="gm-hub"'},
             )
             return None
+
         raw_token = auth[7:].strip()
         tok_hash = sha256_hex(raw_token)
-        rec = self.server.state.tokens.get(tok_hash)
+        rec = state.tokens.get(tok_hash)
         if not rec or rec["revoked"] or rec["expires_at"] <= time.time():
+            state.logger.emit(
+                "WARNING",
+                "auth.denied",
+                security=True,
+                request_id=self._req_id,
+                ip=self._client_ip,
+                route=self._route_name,
+                reason="invalid_or_revoked_token",
+            )
             self._send_json(
                 401,
                 {"error": "invalid_token", "message": "Token is invalid, expired or revoked"},
                 {"WWW-Authenticate": 'Bearer realm="gm-hub"'},
             )
             return None
-        client = self.server.state.clients.get(rec["client_id"])
+
+        client = state.clients.get(rec["client_id"])
         if not client or not client["enabled"]:
             self._send_json(401, {"error": "invalid_token", "message": "Client disabled"})
             return None
+
+        self._client_id = rec["client_id"]
+        self._token_fp = tok_hash[:12]
+
         if required_scope and required_scope not in rec["scopes"]:
-            self.server.state.log("auth.forbidden", client_id=rec["client_id"], need=required_scope)
+            state.logger.emit(
+                "WARNING",
+                "authz.forbidden",
+                security=True,
+                request_id=self._req_id,
+                ip=self._client_ip,
+                client_id=self._client_id,
+                token_fp=self._token_fp,
+                route=self._route_name,
+                required_scope=required_scope,
+            )
             self._send_json(
                 403,
                 {"error": "insufficient_scope", "message": f"Required scope: {required_scope}"},
@@ -217,10 +304,11 @@ class GMHubHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path.rstrip("/") or "/"
+        self._begin_request(path)
         state: HubState = self.server.state
 
         if path == "/api/v1/health":
-            self._send_json(200, {"status": "ok", "service": "gm-hub", "version": "1.0.0"})
+            self._send_json(200, {"status": "ok", "service": "gm-hub", "version": state.version})
             return
 
         if path == "/api/v1/releases":
@@ -247,17 +335,18 @@ class GMHubHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if path == "/api/v1/audit":
+        if path == "/api/v1/metrics":
             auth = self._require_token("audit:read")
             if not auth:
                 return
-            self._send_json(200, {"entries": len(state.audit_log), "tail": state.audit_log[-10:]})
+            self._send_json(200, state.metrics.snapshot())
             return
 
         self._send_json(404, {"error": "not_found", "message": "Route not found"})
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path.rstrip("/") or "/"
+        self._begin_request(path)
         state: HubState = self.server.state
 
         raw = self._read_body()
@@ -272,18 +361,12 @@ class GMHubHandler(BaseHTTPRequestHandler):
 
             auth_hdr = self.headers.get("Authorization", "")
             if not auth_hdr.startswith("Basic "):
-                self._send_json(
-                    400,
-                    {"error": "invalid_request", "message": "Basic client authentication required"},
-                )
+                self._send_json(400, {"error": "invalid_request", "message": "Basic client authentication required"})
                 return
 
             grant_type = form.get("grant_type", [""])[0]
             if grant_type != "client_credentials":
-                self._send_json(
-                    400,
-                    {"error": "unsupported_grant_type", "message": "Only client_credentials is allowed"},
-                )
+                self._send_json(400, {"error": "unsupported_grant_type", "message": "Only client_credentials is allowed"})
                 return
 
             try:
@@ -297,7 +380,18 @@ class GMHubHandler(BaseHTTPRequestHandler):
             fail_rec = state.failures.setdefault(client_id, {"count": 0, "locked_until": 0.0})
             if fail_rec["locked_until"] > now:
                 retry_after = int(fail_rec["locked_until"] - now) + 1
-                state.log("auth.locked", client_id=client_id, retry_after=retry_after)
+                state.logger.emit(
+                    "WARNING",
+                    "auth.denied",
+                    security=True,
+                    request_id=self._req_id,
+                    ip=self._client_ip,
+                    client_id_attempt=client_id,
+                    reason="locked",
+                    retry_after=retry_after,
+                )
+                alerts = state.metrics.record_auth_failure(self._client_ip, client_id, locked=False)
+                state.emit_alerts(alerts, self._req_id, self._client_ip)
                 self._send_json(
                     429,
                     {"error": "too_many_attempts", "message": "Client temporarily locked"},
@@ -313,9 +407,21 @@ class GMHubHandler(BaseHTTPRequestHandler):
             )
             if not valid:
                 fail_rec["count"] += 1
-                if fail_rec["count"] >= state.max_failures:
+                just_locked = fail_rec["count"] >= state.max_failures
+                if just_locked:
                     fail_rec["locked_until"] = now + state.lock_seconds
-                state.log("auth.denied", client_id=client_id, failures=fail_rec["count"])
+                state.logger.emit(
+                    "WARNING",
+                    "auth.denied",
+                    security=True,
+                    request_id=self._req_id,
+                    ip=self._client_ip,
+                    client_id_attempt=client_id,
+                    reason="bad_credentials",
+                    failures=fail_rec["count"],
+                )
+                alerts = state.metrics.record_auth_failure(self._client_ip, client_id, locked=just_locked)
+                state.emit_alerts(alerts, self._req_id, self._client_ip)
                 self._send_json(
                     401,
                     {"error": "invalid_client", "message": "Client authentication failed"},
@@ -338,6 +444,8 @@ class GMHubHandler(BaseHTTPRequestHandler):
 
             raw_token = "gmh_" + secrets.token_urlsafe(32)
             tok_hash = sha256_hex(raw_token)
+            self._client_id = client_id
+            self._token_fp = tok_hash[:12]
             state.tokens[tok_hash] = {
                 "client_id": client_id,
                 "role": client["role"],
@@ -345,7 +453,17 @@ class GMHubHandler(BaseHTTPRequestHandler):
                 "expires_at": now + state.token_ttl,
                 "revoked": False,
             }
-            state.log("auth.token_issued", client_id=client_id, role=client["role"], token_fp=tok_hash[:12])
+            state.logger.emit(
+                "INFO",
+                "auth.token_issued",
+                security=True,
+                request_id=self._req_id,
+                ip=self._client_ip,
+                client_id=client_id,
+                token_fp=tok_hash[:12],
+                role=client["role"],
+                expires_in=state.token_ttl,
+            )
             self._send_json(
                 200,
                 {
@@ -363,7 +481,15 @@ class GMHubHandler(BaseHTTPRequestHandler):
                 return
             tok_hash, rec = auth
             rec["revoked"] = True
-            state.log("auth.token_revoked", client_id=rec["client_id"], token_fp=tok_hash[:12])
+            state.logger.emit(
+                "INFO",
+                "auth.token_revoked",
+                security=True,
+                request_id=self._req_id,
+                ip=self._client_ip,
+                client_id=rec["client_id"],
+                token_fp=tok_hash[:12],
+            )
             self._send_json(200, {"revoked": True, "token_fp": tok_hash[:12]})
             return
 
@@ -397,7 +523,16 @@ class GMHubHandler(BaseHTTPRequestHandler):
                 "published_by": rec["client_id"],
             }
             state.releases[ver] = record
-            state.log("release.published", version=ver, by=rec["client_id"], token_fp=tok_hash[:12])
+            state.logger.emit(
+                "INFO",
+                "release.published",
+                security=True,
+                request_id=self._req_id,
+                ip=self._client_ip,
+                client_id=rec["client_id"],
+                token_fp=tok_hash[:12],
+                release_version=ver,
+            )
             self._send_json(201, {"status": "created", "version": ver, "published_by": rec["client_id"]})
             return
 
