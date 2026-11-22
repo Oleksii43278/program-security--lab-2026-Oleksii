@@ -15,12 +15,14 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from gm_hub_e2ee import ALG_NAME
+from gm_hub_ledger import HubLedger
 from gm_hub_logging import HubLogger, HubMetrics
 
 ROLE_SCOPES: dict[str, set[str]] = {
-    "gm_admin": {"releases:write", "sessions:read", "sessions:write", "audit:read"},
+    "gm_admin": {"releases:write", "sessions:read", "sessions:write", "audit:read", "ledger:read"},
     "player_tester": {"sessions:write", "sessions:read:own"},
-    "auditor": {"audit:read", "sessions:read"},
+    "auditor": {"audit:read", "ledger:read"},
 }
 
 
@@ -123,17 +125,23 @@ class HubState:
         max_failures: int = 5,
         lock_seconds: int = 300,
     ) -> None:
-        self.version = "1.1.0"
+        self.version = "1.2.0"
         self.token_ttl = token_ttl
         self.max_failures = max_failures
         self.lock_seconds = lock_seconds
         self.clients: dict[str, dict] = {}
         self.tokens: dict[str, dict] = {}
         self.releases: dict[str, dict] = {}
+        self.sessions: dict[str, dict] = {}
+        self.recipient_kids: set[str] = set()
         self.failures: dict[str, dict] = {}
+        self.ledger = HubLedger()
         self.logger = HubLogger(log_dir=log_dir, version=self.version)
         self.metrics = HubMetrics()
         self.logger.emit("INFO", "server.initialized", security=True, tls=True, token_ttl_s=token_ttl)
+
+    def register_recipient_kid(self, kid: str) -> None:
+        self.recipient_kids.add(kid)
 
     def add_client(self, client_id: str, role: str) -> str:
         if role not in ROLE_SCOPES:
@@ -178,7 +186,7 @@ class SecureHTTPServer(ThreadingHTTPServer):
 
 
 class GMHubHandler(BaseHTTPRequestHandler):
-    server_version = "TaleSpireGMHub/1.1"
+    server_version = "TaleSpireGMHub/1.2"
 
     def log_message(self, format, *args) -> None:
         pass
@@ -228,14 +236,18 @@ class GMHubHandler(BaseHTTPRequestHandler):
         )
         state.emit_alerts(alerts, self._req_id, self._client_ip)
 
-    def _read_body(self, max_bytes: int = 16384) -> bytes | None:
+    def _read_body(self, max_bytes: int = 32768) -> bytes | None:
         length = int(self.headers.get("Content-Length", "0"))
         if length > max_bytes:
             self._send_json(413, {"error": "payload_too_large", "message": "Request body exceeds limit"})
             return None
         return self.rfile.read(length) if length > 0 else b""
 
-    def _require_token(self, required_scope: str | None = None) -> tuple[str, dict] | None:
+    def _require_token(
+        self,
+        required_scope: str | None = None,
+        any_scopes: set[str] | None = None,
+    ) -> tuple[str, dict] | None:
         state: HubState = self.server.state
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
@@ -300,6 +312,22 @@ class GMHubHandler(BaseHTTPRequestHandler):
                 {"error": "insufficient_scope", "message": f"Required scope: {required_scope}"},
             )
             return None
+
+        if any_scopes and not (rec["scopes"] & any_scopes):
+            need = " or ".join(sorted(any_scopes))
+            state.logger.emit(
+                "WARNING",
+                "authz.forbidden",
+                security=True,
+                request_id=self._req_id,
+                ip=self._client_ip,
+                client_id=self._client_id,
+                token_fp=self._token_fp,
+                route=self._route_name,
+                required_scope=need,
+            )
+            self._send_json(403, {"error": "insufficient_scope", "message": f"Required scope: {need}"})
+            return None
         return tok_hash, rec
 
     def do_GET(self) -> None:
@@ -340,6 +368,54 @@ class GMHubHandler(BaseHTTPRequestHandler):
             if not auth:
                 return
             self._send_json(200, state.metrics.snapshot())
+            return
+
+        if path == "/api/v1/sessions":
+            auth = self._require_token(any_scopes={"sessions:read", "sessions:read:own"})
+            if not auth:
+                return
+            _, rec = auth
+            can_all = "sessions:read" in rec["scopes"]
+            items = []
+            for sid, env in state.sessions.items():
+                if can_all or env["meta"]["submitter"] == rec["client_id"]:
+                    items.append({
+                        "session_id": sid,
+                        "submitter": env["meta"]["submitter"],
+                        "kid": env["kid"],
+                        "created": env["meta"].get("created"),
+                        "ct_len": len(env["ct"]),
+                    })
+            self._send_json(200, {"count": len(items), "sessions": items})
+            return
+
+        if path.startswith("/api/v1/sessions/"):
+            auth = self._require_token(any_scopes={"sessions:read", "sessions:read:own"})
+            if not auth:
+                return
+            _, rec = auth
+            sid = path.rsplit("/", 1)[-1]
+            env = state.sessions.get(sid)
+            can_all = "sessions:read" in rec["scopes"]
+            if not env or (not can_all and env["meta"]["submitter"] != rec["client_id"]):
+                self._send_json(404, {"error": "not_found", "message": "Session report not found"})
+                return
+            self._send_json(200, env)
+            return
+
+        if path == "/api/v1/ledger":
+            auth = self._require_token("ledger:read")
+            if not auth:
+                return
+            self._send_json(200, {"count": len(state.ledger.blocks), "head": state.ledger.head(), "blocks": state.ledger.blocks})
+            return
+
+        if path == "/api/v1/ledger/verify":
+            auth = self._require_token("ledger:read")
+            if not auth:
+                return
+            ok, errs = state.ledger.verify(state.releases, state.sessions)
+            self._send_json(200, {"ok": ok, "blocks": len(state.ledger.blocks), "head": state.ledger.head(), "errors": errs})
             return
 
         self._send_json(404, {"error": "not_found", "message": "Route not found"})
@@ -523,6 +599,7 @@ class GMHubHandler(BaseHTTPRequestHandler):
                 "published_by": rec["client_id"],
             }
             state.releases[ver] = record
+            receipt = state.ledger.append("release", ver, record)
             state.logger.emit(
                 "INFO",
                 "release.published",
@@ -532,8 +609,51 @@ class GMHubHandler(BaseHTTPRequestHandler):
                 client_id=rec["client_id"],
                 token_fp=tok_hash[:12],
                 release_version=ver,
+                ledger_idx=receipt["idx"],
             )
-            self._send_json(201, {"status": "created", "version": ver, "published_by": rec["client_id"]})
+            self._send_json(201, {"status": "created", "version": ver, "published_by": rec["client_id"], "receipt": receipt})
+            return
+
+        if path == "/api/v1/sessions":
+            auth = self._require_token("sessions:write")
+            if not auth:
+                return
+            tok_hash, rec = auth
+            try:
+                env = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send_json(400, {"error": "invalid_json", "message": "Malformed JSON payload"})
+                return
+            req_fields = {"v", "alg", "kid", "epk", "nonce", "ct", "meta"}
+            if not req_fields.issubset(env.keys()) or env.get("alg") != ALG_NAME:
+                self._send_json(400, {"error": "invalid_envelope", "message": "Invalid E2EE envelope format"})
+                return
+            meta = env.get("meta")
+            if not isinstance(meta, dict) or meta.get("submitter") != rec["client_id"]:
+                self._send_json(400, {"error": "submitter_mismatch", "message": "meta.submitter must match authenticated client"})
+                return
+            if env["kid"] not in state.recipient_kids:
+                self._send_json(400, {"error": "unknown_recipient_key", "message": "Recipient key id is not registered"})
+                return
+            sid = str(meta.get("session_id", "")).strip()
+            if not sid or sid in state.sessions:
+                self._send_json(409, {"error": "conflict", "message": "Duplicate or missing session_id"})
+                return
+            state.sessions[sid] = env
+            receipt = state.ledger.append("session", sid, env)
+            state.logger.emit(
+                "INFO",
+                "session.submitted",
+                security=True,
+                request_id=self._req_id,
+                ip=self._client_ip,
+                client_id=rec["client_id"],
+                token_fp=tok_hash[:12],
+                session_id=sid,
+                kid=env["kid"],
+                ledger_idx=receipt["idx"],
+            )
+            self._send_json(201, {"status": "accepted", "session_id": sid, "kid": env["kid"], "receipt": receipt})
             return
 
         self._send_json(404, {"error": "not_found", "message": "Route not found"})
