@@ -5,7 +5,7 @@ import os
 import shutil
 import ssl
 import tempfile
-import threading
+import threading, time
 from urllib.parse import urlencode
 
 from gm_hub_logging import verify_security_chain
@@ -224,7 +224,7 @@ def run_selftest() -> None:
                 )
             for i in range(10):
                 https_req(port, ctx_ok, "GET", f"/api/v1/probe_{i}")
-            fired_rules = {e["rule"] for e in state.logger.memory_security if e["event"] == "alert.raised"}
+            time.sleep(0.1); fired_rules = {e["rule"] for e in state.logger.memory_security if e["event"] == "alert.raised"}
             check(
                 18,
                 "ЛР12 Алерти: lockout, bruteforce_ip, scan_404",

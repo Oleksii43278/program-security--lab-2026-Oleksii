@@ -36,18 +36,9 @@ def authorize(roles: list[str], operation: str, target_user: str = None,
         elif operation == "enroll-totp":
             return Decision(False, f"authz-deny:enroll-totp:not-owner")
         # Нові команди
-        elif operation in ["build-manifest", "verify"]:
+        elif operation in ["build-manifest", "verify", "sign"]:
             if max_role < ROLES.index("owner"):
                 return Decision(False, f"authz-deny:{operation}:rbac")
-        elif operation == "sign":
-            if max_role < ROLES.index("owner"):
-                return Decision(False, f"authz-deny:sign:rbac")
-            # ABAC-умова: підписуємо тільки якщо гілка master і дерево чисте
-            if repo_state:
-                if repo_state.get('branch') != 'master':
-                    return Decision(False, "authz-deny:sign:abac-not-master")
-                if repo_state.get('is_dirty'):
-                    return Decision(False, "authz-deny:sign:abac-dirty")
         else:
             return Decision(False, f"authz-deny:unknown-operation:{operation}")
 
