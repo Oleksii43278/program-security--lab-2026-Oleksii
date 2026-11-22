@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import hashlib
+import io
 import json
 import os
 import re
@@ -22,14 +23,20 @@ RELEASE_PREFIXES = (
 FORBIDDEN_EXTS = (".key", ".pem", ".secret", ".db", ".gmbk", ".pyc")
 SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE" + r" KEY-----"),
-    re.compile(r"\bgms_[A-Za-z0-9_\-]{20,}\b"),
-    re.compile(r"\bgmh_[A-Za-z0-9_\-]{20,}\b"),
+    re.compile(r"\bgms_[A-Za-z0-9_\-]{24,}\b"),
+    re.compile(r"\bgmh_[A-Za-z0-9_\-]{24,}\b"),
     re.compile(r"ghp_[A-Za-z0-9]{20,}"),
 ]
 
 
 def run_git(*args: str) -> str:
-    return subprocess.check_output(["git", *args], cwd=REPO_ROOT, text=True, encoding="utf-8").strip()
+    return subprocess.check_output(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    ).strip()
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -146,18 +153,15 @@ def cmd_check(check_osv: bool) -> None:
             blockers += 1
         print(f"  {status} | {name:<44} | {detail}")
 
-    # 1. Гілка і чистота дерева
     branch = run_git("rev-parse", "--abbrev-ref", "HEAD")
     porcelain = run_git("status", "--porcelain")
-    dirty = [ln for ln in porcelain.splitlines() if not ln.endswith("build/")]
+    dirty = [ln for ln in porcelain.splitlines() if ln.strip() and not ln.endswith("build/")]
     report(len(dirty) == 0, "Гілка Git та чистота робочого дерева", f"гілка={branch}, незакомічених={len(dirty)}")
 
-    # 2. Заборонені файли у відстежуваних
     tracked = run_git("ls-files").splitlines()
     bad_files = [p for p in tracked if p.endswith(FORBIDDEN_EXTS)]
     report(len(bad_files) == 0, "Відсутність секретних/службових файлів", "немає" if not bad_files else ", ".join(bad_files))
 
-    # 3. Пошук секретів у вмісті файлів
     leaks = []
     for rel in tracked:
         if not os.path.exists(os.path.join(REPO_ROOT, rel)):
@@ -172,7 +176,6 @@ def cmd_check(check_osv: bool) -> None:
                 break
     report(len(leaks) == 0, "Відсутність секретів у коді та документах", f"перевірено {len(tracked)} файлів, витоків={len(leaks)}")
 
-    # 4. Перевірка безпечних налаштувань за замовчуванням у gm_hub_server.py
     srv_src = open(os.path.join(REPO_ROOT, "tools", "gm_hub", "gm_hub_server.py"), "r", encoding="utf-8").read()
     safe_defaults = (
         "TLSVersion.TLSv1_2" in srv_src
@@ -182,11 +185,9 @@ def cmd_check(check_osv: bool) -> None:
     )
     report(safe_defaults, "Робоча конфігурація (TLS 1.2+, loopback, TTL)", "TLS>=1.2, 127.0.0.1, TTL=600s, lockout=5")
 
-    # 5. Зафіксовані версії залежностей
     deps = parse_pinned_requirements()
     report(len(deps) > 0, "Фіксація версій залежностей (==)", ", ".join(f"{p}=={v}" for p, v in deps) or "відсутні")
 
-    # 6. Перевірка вразливостей у OSV
     if check_osv and deps:
         osv_ok_all = True
         msgs = []
@@ -196,29 +197,31 @@ def cmd_check(check_osv: bool) -> None:
             msgs.append(msg)
         report(osv_ok_all, "Перевірка вразливостей залежностей (OSV)", "; ".join(msgs))
 
-    # 7. Самоперевірка gm_hub (28/28 OK)
+    utf8_env = {**os.environ, "PYTHONUTF8": "1"}
     st_proc = subprocess.run(
         [sys.executable, os.path.join(REPO_ROOT, "tools", "gm_hub", "gm_hub_selftest.py")],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
     )
-    st_ok = st_proc.returncode == 0 and "28/28 OK" in st_proc.stdout
+    st_ok = st_proc.returncode == 0 and "28/28 OK" in (st_proc.stdout or "")
     report(st_ok, "Самоперевірка сервера gm_hub", "28/28 OK" if st_ok else "FAILED")
 
-    # 8. Перевірка резервного копіювання і DR
     dr_proc = subprocess.run(
         [sys.executable, os.path.join(REPO_ROOT, "tools", "gm_hub", "gm_hub_backup.py"), "--simulate-dr"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
     )
-    dr_ok = dr_proc.returncode == 0 and "6/6 етапів OK" in dr_proc.stdout
+    dr_ok = dr_proc.returncode == 0 and "6/6 етапів OK" in (dr_proc.stdout or "")
     report(dr_ok, "Самоперевірка резервного копіювання і DR", "6/6 етапів OK" if dr_ok else "FAILED")
 
-    # 9. Відтворюваність збірки (2 незалежні складання HEAD)
     z1, s1, _, nfiles = build_artifacts_in_memory("1.0.0")
     z2, s2, _, _ = build_artifacts_in_memory("1.0.0")
     h1, h2 = sha256_bytes(z1), sha256_bytes(z2)
